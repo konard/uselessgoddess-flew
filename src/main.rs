@@ -2,14 +2,19 @@ use {
   bevy::{
     asset::RenderAssetUsages,
     image::ImageSampler,
+    pbr::MaterialPipelineKey,
     prelude::*,
-    render::render_resource::{
-      AsBindGroup, Extent3d, Face, ShaderType, TextureDimension, TextureFormat,
+    render::{
+      mesh::MeshVertexBufferLayoutRef,
+      render_resource::{
+        AsBindGroup, Extent3d, RenderPipelineDescriptor, ShaderType,
+        SpecializedMeshPipelineError, TextureDimension, TextureFormat,
+      },
     },
     shader::ShaderRef,
   },
   dicom::object::open_file,
-  std::{fs, path::Path},
+  std::fs,
 };
 
 use bevy_flycam::prelude::*;
@@ -179,14 +184,15 @@ fn setup(
     TextureFormat::R32Float,
     RenderAssetUsages::all(),
   );
-  image.sampler = ImageSampler::nearest();
+  // Use linear filtering for smooth interpolation between voxels
+  image.sampler = ImageSampler::linear();
   let image_handle = images.add(image);
 
   commands.spawn((
     Mesh3d(meshes.add(Cuboid::from_length(1.0))),
     MeshMaterial3d(materials.add(VolumeMaterial {
       volume_texture: image_handle,
-      config: MaterialConfig { threshold: 0.25 },
+      config: MaterialConfig::default(),
     })),
     Transform::from_xyz(0.0, 0.0, 0.0),
   ));
@@ -203,6 +209,8 @@ fn setup(
   ));
 }
 
+/// Material for volume raymarching rendering of CT/DICOM data.
+/// Supports flying inside the volume with proper culling disabled.
 #[derive(Asset, TypePath, AsBindGroup, Debug, Clone)]
 pub struct VolumeMaterial {
   #[texture(0, dimension = "3d")]
@@ -213,16 +221,61 @@ pub struct VolumeMaterial {
   pub config: MaterialConfig,
 }
 
-#[derive(Clone, Default, ShaderType, Debug)]
+/// Configuration parameters for volume rendering.
+/// These can be adjusted in real-time for interactive exploration.
+#[derive(Clone, ShaderType, Debug)]
 pub struct MaterialConfig {
+  /// Density threshold below which voxels are considered transparent.
+  /// Higher values show only dense structures (bones).
+  /// Range: 0.0 - 1.0, default: 0.25
   pub threshold: f32,
+
+  /// Number of raymarching steps. More steps = better quality, slower.
+  /// Range: 32 - 512, default: 128
+  pub step_count: f32,
+
+  /// Density scale factor for opacity accumulation.
+  /// Higher values = more opaque rendering.
+  /// Range: 1.0 - 50.0, default: 15.0
+  pub density_scale: f32,
+
+  /// Jitter strength for reducing banding artifacts.
+  /// Range: 0.0 - 1.0, default: 0.5
+  pub jitter_strength: f32,
+}
+
+impl Default for MaterialConfig {
+  fn default() -> Self {
+    Self {
+      threshold: 0.25,
+      step_count: 128.0,
+      density_scale: 15.0,
+      jitter_strength: 0.5,
+    }
+  }
 }
 
 impl Material for VolumeMaterial {
   fn fragment_shader() -> ShaderRef {
     "shaders/volume.wgsl".into()
   }
+
   fn alpha_mode(&self) -> AlphaMode {
     AlphaMode::Blend
+  }
+
+  /// Disable backface culling to allow flying inside the volume.
+  /// This is critical for medical visualization where the camera
+  /// needs to explore inside anatomical structures.
+  fn specialize(
+    _pipeline: &bevy::pbr::MaterialPipeline<Self>,
+    descriptor: &mut RenderPipelineDescriptor,
+    _layout: &MeshVertexBufferLayoutRef,
+    _key: MaterialPipelineKey<Self>,
+  ) -> Result<(), SpecializedMeshPipelineError> {
+    // Disable culling - render both front and back faces
+    // This allows the camera to fly inside the volume cube
+    descriptor.primitive.cull_mode = None;
+    Ok(())
   }
 }

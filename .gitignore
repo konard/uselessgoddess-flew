@@ -1,3 +1,5 @@
 /target
-/assets
+# Ignore DICOM patient data but keep shaders
+/assets/dicom
+!/assets/shaders
 
