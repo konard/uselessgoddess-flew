@@ -2,14 +2,19 @@ use {
   bevy::{
     asset::RenderAssetUsages,
     image::ImageSampler,
+    pbr::MaterialPipelineKey,
     prelude::*,
-    render::render_resource::{
-      AsBindGroup, Extent3d, Face, ShaderType, TextureDimension, TextureFormat,
+    render::{
+      mesh::MeshVertexBufferLayoutRef,
+      render_resource::{
+        AsBindGroup, Extent3d, RenderPipelineDescriptor, ShaderType,
+        SpecializedMeshPipelineError, TextureDimension, TextureFormat,
+      },
     },
     shader::ShaderRef,
   },
   dicom::object::open_file,
-  std::{fs, path::Path},
+  std::fs,
 };
 
 use bevy_flycam::prelude::*;
@@ -18,7 +23,6 @@ const DICOM_FOLDER: &str = "assets/dicom";
 const MIN_HU: f32 = -1000.0;
 const MAX_HU: f32 = 3000.0;
 
-// --- НАСТРОЙКА РАЗРЕШЕНИЯ ---
 // 1 = 512x512, 2 = 256x256, 4 = 128x128
 const DOWNSCALE_FACTOR: usize = 1;
 
@@ -29,7 +33,7 @@ fn main() {
     .add_plugins(NoCameraPlayerPlugin)
     .insert_resource(MovementSettings {
       sensitivity: 0.00015,
-      speed: 12.0, // Можете уменьшить скорость, если модель 1.0 метр
+      speed: 12.0,
     })
     .insert_resource(KeyBindings {
       move_ascend: KeyCode::KeyE,
@@ -37,7 +41,6 @@ fn main() {
       ..Default::default()
     })
     .add_systems(Startup, setup)
-    // .add_systems(Update, rotate_cube) // Отключите вращение, чтобы летать самим
     .run();
 }
 
@@ -71,21 +74,20 @@ fn load_dicom_volume(folder_path: &str) -> VolumeInfo {
     }
   });
 
-  // --- ДАУНСКЕЙЛ (уменьшение количества файлов/слоев) ---
   let filtered_files: Vec<_> =
     files.into_iter().step_by(DOWNSCALE_FACTOR).collect();
   let new_depth = filtered_files.len() as u32;
 
-  let mut width = 0;
-  let mut height = 0;
-  let mut new_width = 0;
-  let mut new_height = 0;
+  let mut width = 0u32;
+  let mut height = 0u32;
+  let mut new_width = 0u32;
+  let mut new_height = 0u32;
 
   let mut final_voxels: Vec<f32> = vec![];
 
   for (i, path) in filtered_files.iter().enumerate() {
     if i % 10 == 0 {
-      println!("Loading downscaled slice {}/{}", i, new_depth);
+      println!("Loading slice {}/{}", i, new_depth);
     }
 
     let obj = open_file(path).unwrap();
@@ -102,10 +104,8 @@ fn load_dicom_volume(folder_path: &str) -> VolumeInfo {
         .and_then(|e| e.to_int().ok())
         .unwrap_or(512);
 
-      // Вычисляем новые размеры
       new_width = width / (DOWNSCALE_FACTOR as u32);
       new_height = height / (DOWNSCALE_FACTOR as u32);
-      // Резервируем память под финальный массив
       final_voxels.reserve_exact((new_width * new_height * new_depth) as usize);
     }
 
@@ -125,10 +125,8 @@ fn load_dicom_volume(folder_path: &str) -> VolumeInfo {
     let pixel_bytes =
       obj.element_by_name("PixelData").unwrap().to_bytes().unwrap();
 
-    // --- ДАУНСКЕЙЛ (пропуск пикселей по X и Y) ---
     for r in 0..new_height {
       for c in 0..new_width {
-        // Исходные координаты в файле 512x512
         let orig_y = r * (DOWNSCALE_FACTOR as u32);
         let orig_x = c * (DOWNSCALE_FACTOR as u32);
 
@@ -148,7 +146,7 @@ fn load_dicom_volume(folder_path: &str) -> VolumeInfo {
   }
 
   println!(
-    "Volume Loaded! New Scaled Size: {}x{}x{}",
+    "Volume loaded: {}x{}x{}",
     new_width, new_height, new_depth
   );
 
@@ -179,14 +177,14 @@ fn setup(
     TextureFormat::R32Float,
     RenderAssetUsages::all(),
   );
-  image.sampler = ImageSampler::nearest();
+  image.sampler = ImageSampler::linear();
   let image_handle = images.add(image);
 
   commands.spawn((
     Mesh3d(meshes.add(Cuboid::from_length(1.0))),
     MeshMaterial3d(materials.add(VolumeMaterial {
       volume_texture: image_handle,
-      config: MaterialConfig { threshold: 0.25 },
+      config: MaterialConfig::default(),
     })),
     Transform::from_xyz(0.0, 0.0, 0.0),
   ));
@@ -196,13 +194,10 @@ fn setup(
     Camera3d::default(),
     Transform::from_xyz(0.0, 0.0, 2.0).looking_at(Vec3::ZERO, Vec3::Y),
   ));
-
-  commands.spawn((
-    PointLight { intensity: 1500.0, ..default() },
-    Transform::from_xyz(4.0, 8.0, 4.0),
-  ));
 }
 
+/// Material for GPU raymarching of CT/DICOM volumetric data.
+/// Supports flying inside the volume from any angle.
 #[derive(Asset, TypePath, AsBindGroup, Debug, Clone)]
 pub struct VolumeMaterial {
   #[texture(0, dimension = "3d")]
@@ -213,16 +208,47 @@ pub struct VolumeMaterial {
   pub config: MaterialConfig,
 }
 
-#[derive(Clone, Default, ShaderType, Debug)]
+/// Runtime parameters for the volume renderer.
+#[derive(Clone, ShaderType, Debug)]
 pub struct MaterialConfig {
+  /// Density threshold separating soft tissue from bone (0.0–1.0).
   pub threshold: f32,
+  /// Number of raymarching steps; more steps improve quality at the cost of performance.
+  pub step_count: f32,
+  /// Opacity multiplier applied during compositing.
+  pub density_scale: f32,
+  /// Per-ray jitter magnitude to suppress banding artefacts (0.0–1.0).
+  pub jitter_strength: f32,
+}
+
+impl Default for MaterialConfig {
+  fn default() -> Self {
+    Self {
+      threshold: 0.25,
+      step_count: 128.0,
+      density_scale: 15.0,
+      jitter_strength: 0.5,
+    }
+  }
 }
 
 impl Material for VolumeMaterial {
   fn fragment_shader() -> ShaderRef {
     "shaders/volume.wgsl".into()
   }
+
   fn alpha_mode(&self) -> AlphaMode {
     AlphaMode::Blend
+  }
+
+  /// Disable backface culling so the camera can fly inside the volume.
+  fn specialize(
+    _pipeline: &bevy::pbr::MaterialPipeline<Self>,
+    descriptor: &mut RenderPipelineDescriptor,
+    _layout: &MeshVertexBufferLayoutRef,
+    _key: MaterialPipelineKey<Self>,
+  ) -> Result<(), SpecializedMeshPipelineError> {
+    descriptor.primitive.cull_mode = None;
+    Ok(())
   }
 }
