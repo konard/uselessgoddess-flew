@@ -1,35 +1,45 @@
-// Volume Raymarching Shader for Medical Visualization
-// SOTA implementation with proper ray-box intersection, early termination,
-// and support for camera flying inside the volume
+// Volume Raymarching Shader for Medical CT Visualization
+// ========================================================
+// SOTA implementation featuring:
+// - Proper ray-box intersection with camera inside volume support
+// - Front-to-back alpha compositing with early ray termination
+// - Gradient-based shading for depth perception
+// - Adaptive step refinement near surfaces
+// - Jittered sampling for anti-banding
+// - Medical transfer function (bones white, soft tissue reddish)
 
-// Import Bevy's standard bindings
 #import bevy_pbr::{
     mesh_view_bindings::view,
     mesh_bindings::mesh,
     forward_io::VertexOutput,
 }
 
-// Material bindings
+// --- Material bindings ---
 @group(2) @binding(0) var volume_texture: texture_3d<f32>;
 @group(2) @binding(1) var volume_sampler: sampler;
 
 struct MaterialConfig {
-    threshold: f32,          // Density threshold for bone visualization
-    step_count: f32,         // Number of raymarching steps
-    density_scale: f32,      // Density multiplier for transparency
-    jitter_strength: f32,    // Jitter to reduce banding artifacts
+    threshold: f32,       // Density threshold for bone visualization (0.0-1.0)
+    step_count: f32,      // Base raymarching steps (32-512)
+    density_scale: f32,   // Opacity multiplier (1.0-50.0)
+    jitter_strength: f32, // Anti-banding jitter (0.0-1.0)
 }
 @group(2) @binding(2) var<uniform> config: MaterialConfig;
 
-// Constants
-const MAX_STEPS: i32 = 256;
-const MIN_STEP_SIZE: f32 = 0.001;
+// --- Constants ---
+const MAX_STEPS: i32 = 512;
+const MIN_STEP_SIZE: f32 = 0.0005;
+const GRADIENT_DELTA: f32 = 0.005;
+const EARLY_TERMINATION_ALPHA: f32 = 0.98;
 
-// Ray-box intersection for unit cube centered at origin [-0.5, 0.5]
-// Returns (t_near, t_far) - intersection distances along ray
-// t_near > t_far means no intersection
+// =============================================================================
+// Ray-Box Intersection (Slab method)
+// For unit cube centered at origin: bounds = [-0.5, 0.5]
+// Returns vec2(t_near, t_far). If t_near > t_far, ray misses the box.
+// =============================================================================
 fn ray_box_intersection(ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> vec2<f32> {
-    let inv_dir = 1.0 / ray_dir;
+    // Avoid division by zero with small epsilon
+    let inv_dir = 1.0 / (ray_dir + vec3<f32>(1e-10));
 
     let t0 = (-0.5 - ray_origin) * inv_dir;
     let t1 = (0.5 - ray_origin) * inv_dir;
@@ -43,168 +53,271 @@ fn ray_box_intersection(ray_origin: vec3<f32>, ray_dir: vec3<f32>) -> vec2<f32> 
     return vec2<f32>(t_near, t_far);
 }
 
-// Convert world position to texture UV coordinates [0, 1]
-fn world_to_uv(world_pos: vec3<f32>) -> vec3<f32> {
-    return world_pos + 0.5; // Map [-0.5, 0.5] to [0, 1]
+// =============================================================================
+// Coordinate conversion: local cube space [-0.5, 0.5] -> texture UV [0, 1]
+// =============================================================================
+fn local_to_uv(local_pos: vec3<f32>) -> vec3<f32> {
+    return local_pos + 0.5;
 }
 
-// Sample volume density at given UV coordinate
+// =============================================================================
+// Sample volume density at UV coordinate
+// =============================================================================
 fn sample_volume(uv: vec3<f32>) -> f32 {
     return textureSampleLevel(volume_texture, volume_sampler, uv, 0.0).r;
 }
 
-// Transfer function: maps density to color and opacity
-// For medical CT data: bones are bright (high density), soft tissue is darker
-fn transfer_function(density: f32, threshold: f32) -> vec4<f32> {
-    // Skip below threshold (mostly air/noise)
-    if density < threshold * 0.5 {
+// =============================================================================
+// Compute gradient (central differences) for lighting
+// Returns normalized gradient direction
+// =============================================================================
+fn compute_gradient(uv: vec3<f32>) -> vec3<f32> {
+    let d = GRADIENT_DELTA;
+
+    let gx = sample_volume(uv + vec3<f32>(d, 0.0, 0.0)) -
+             sample_volume(uv - vec3<f32>(d, 0.0, 0.0));
+    let gy = sample_volume(uv + vec3<f32>(0.0, d, 0.0)) -
+             sample_volume(uv - vec3<f32>(0.0, d, 0.0));
+    let gz = sample_volume(uv + vec3<f32>(0.0, 0.0, d)) -
+             sample_volume(uv - vec3<f32>(0.0, 0.0, d));
+
+    let grad = vec3<f32>(gx, gy, gz);
+    let len = length(grad);
+
+    // Return normalized gradient, or zero if too small
+    if len < 0.0001 {
+        return vec3<f32>(0.0);
+    }
+    return grad / len;
+}
+
+// =============================================================================
+// Medical Transfer Function
+// Maps CT density values to RGBA colors
+// - Air/noise: transparent
+// - Soft tissue: semi-transparent reddish
+// - Bone: opaque white/gray with gradient shading
+// =============================================================================
+fn transfer_function(density: f32, threshold: f32, gradient: vec3<f32>, light_dir: vec3<f32>) -> vec4<f32> {
+    // Region 1: Below noise floor - fully transparent
+    let noise_floor = threshold * 0.4;
+    if density < noise_floor {
         return vec4<f32>(0.0);
     }
 
-    // Soft tissue region [threshold*0.5, threshold]
+    // Region 2: Soft tissue [noise_floor, threshold]
     if density < threshold {
-        let t = (density - threshold * 0.5) / (threshold * 0.5);
-        let color = vec3<f32>(0.8, 0.3, 0.3) * t; // Reddish for soft tissue
-        let alpha = t * 0.1; // Very transparent
-        return vec4<f32>(color, alpha);
+        let t = (density - noise_floor) / (threshold - noise_floor);
+        let soft_tissue_color = vec3<f32>(0.75, 0.25, 0.25); // Reddish
+        let alpha = t * t * 0.08; // Quadratic falloff, very transparent
+        return vec4<f32>(soft_tissue_color * t, alpha);
     }
 
-    // Bone region [threshold, 1.0]
-    let bone_t = (density - threshold) / (1.0 - threshold);
+    // Region 3: Bone [threshold, 1.0]
+    let bone_t = (density - threshold) / (1.0 - threshold + 0.001);
 
-    // Color gradient: light gray to white for bones
-    let bone_color = mix(
-        vec3<f32>(0.85, 0.85, 0.82),  // Light bone
-        vec3<f32>(1.0, 1.0, 0.98),     // Dense bone (white)
+    // Base bone color: warm white gradient
+    let bone_base = mix(
+        vec3<f32>(0.88, 0.86, 0.82), // Light bone (slight warm tint)
+        vec3<f32>(1.0, 0.99, 0.97),  // Dense bone (near white)
         bone_t
     );
 
-    // Opacity increases with density
-    let alpha = mix(0.3, 0.95, bone_t);
+    // Apply gradient-based shading for depth perception
+    var shading = 1.0;
+    if length(gradient) > 0.1 {
+        // Diffuse lighting: dot(normal, light_dir)
+        // Normal points in direction of increasing density (into the bone)
+        let diffuse = max(dot(-gradient, light_dir), 0.0);
+        // Add ambient and diffuse components
+        shading = 0.4 + 0.6 * diffuse;
+    }
+
+    let bone_color = bone_base * shading;
+
+    // Opacity: higher for denser bone
+    let alpha = mix(0.35, 0.97, bone_t * bone_t);
 
     return vec4<f32>(bone_color, alpha);
 }
 
-// Pseudo-random for jittering (to reduce banding)
+// =============================================================================
+// Pseudo-random hash for jittering (anti-banding)
+// =============================================================================
 fn hash(p: vec2<f32>) -> f32 {
     let h = dot(p, vec2<f32>(127.1, 311.7));
     return fract(sin(h) * 43758.5453123);
 }
 
-@fragment
-fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
-    // Get world-space position of fragment on the cube surface
-    let world_pos = in.world_position.xyz;
-
-    // Get mesh transform (inverse needed to convert to local space)
-    let model_matrix = mesh[in.instance_index].world_from_local;
-    let inv_model = transpose(mat3x3<f32>(
-        model_matrix[0].xyz,
-        model_matrix[1].xyz,
-        model_matrix[2].xyz
-    ));
-
-    // Camera position in world space
-    let camera_world = view.world_position;
-
-    // Transform to local/object space (unit cube centered at origin)
-    // We need to account for the mesh transform
-    let local_pos = (vec4<f32>(world_pos, 1.0) * transpose(model_matrix)).xyz;
-    let camera_local = (vec4<f32>(camera_world, 1.0) * transpose(model_matrix)).xyz;
-
-    // Actually, let's simplify: assume unit cube at origin with identity transform
-    // The world_pos IS already the local position for a unit cube centered at origin
-    let ray_origin = camera_world;
-    let ray_dir = normalize(world_pos - camera_world);
-
-    // Transform ray to local space of unit cube
-    // For a cube at origin with scale 1, local = world (after mesh transform)
-    // We need to use the mesh's world_from_local matrix
+// =============================================================================
+// Transform world-space ray to local cube space
+// Properly handles mesh transform (translation, rotation, scale)
+// =============================================================================
+fn transform_ray_to_local(
+    world_origin: vec3<f32>,
+    world_dir: vec3<f32>,
+    model_matrix: mat4x4<f32>
+) -> array<vec3<f32>, 2> {
+    // Extract scale from model matrix columns
     let scale = vec3<f32>(
         length(model_matrix[0].xyz),
         length(model_matrix[1].xyz),
         length(model_matrix[2].xyz)
     );
+
+    // Extract rotation matrix (normalized columns)
+    let rot_x = model_matrix[0].xyz / scale.x;
+    let rot_y = model_matrix[1].xyz / scale.y;
+    let rot_z = model_matrix[2].xyz / scale.z;
+
+    // Build inverse rotation (transpose for orthogonal matrix)
+    let inv_rot = mat3x3<f32>(
+        vec3<f32>(rot_x.x, rot_y.x, rot_z.x),
+        vec3<f32>(rot_x.y, rot_y.y, rot_z.y),
+        vec3<f32>(rot_x.z, rot_y.z, rot_z.z)
+    );
+
+    // Translation
     let translation = model_matrix[3].xyz;
 
-    // Transform ray to local cube space
-    let local_ray_origin = (ray_origin - translation) / scale;
-    let local_ray_dir = normalize(ray_dir / scale);
+    // Transform origin: translate then rotate then scale
+    let local_origin = inv_rot * (world_origin - translation) / scale;
 
-    // Ray-box intersection
-    let t_hit = ray_box_intersection(local_ray_origin, local_ray_dir);
+    // Transform direction: rotate then scale (direction doesn't translate)
+    let local_dir = normalize(inv_rot * world_dir / scale);
 
-    // Check if ray misses the volume
+    return array<vec3<f32>, 2>(local_origin, local_dir);
+}
+
+// =============================================================================
+// Fragment shader - Main raymarching entry point
+// =============================================================================
+@fragment
+fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
+    // Get world-space fragment position (on cube surface)
+    let world_frag_pos = in.world_position.xyz;
+
+    // Get camera position in world space
+    let camera_world = view.world_position;
+
+    // Get mesh transform matrix
+    let model_matrix = mesh[in.instance_index].world_from_local;
+
+    // Compute world-space ray direction
+    let world_ray_dir = normalize(world_frag_pos - camera_world);
+
+    // Transform ray to local cube space (unit cube centered at origin)
+    let local_ray = transform_ray_to_local(camera_world, world_ray_dir, model_matrix);
+    let local_origin = local_ray[0];
+    let local_dir = local_ray[1];
+
+    // Ray-box intersection in local space
+    let t_hit = ray_box_intersection(local_origin, local_dir);
+
+    // Check if ray misses the volume entirely
     if t_hit.x > t_hit.y {
         discard;
     }
 
-    // Clamp near plane to 0 if camera is inside the volume
+    // Handle camera inside volume: clamp t_near to 0
     let t_near = max(t_hit.x, 0.0);
     let t_far = t_hit.y;
 
-    // Early exit if behind camera
+    // Early exit if volume is behind camera
     if t_far < 0.0 {
         discard;
     }
 
-    // Calculate step size based on config
-    let step_count = i32(config.step_count);
+    // Calculate adaptive step size
     let ray_length = t_far - t_near;
-    var step_size = ray_length / f32(step_count);
+    let base_steps = i32(config.step_count);
+    var step_size = ray_length / f32(base_steps);
     step_size = max(step_size, MIN_STEP_SIZE);
 
-    // Jitter starting position to reduce banding artifacts
+    // Jitter ray start to reduce banding artifacts
     let jitter = hash(in.position.xy) * config.jitter_strength;
     var t = t_near + jitter * step_size;
 
-    // Front-to-back compositing
+    // Light direction for shading (from camera, slightly above)
+    let light_dir = normalize(vec3<f32>(0.2, 0.5, 1.0));
+
+    // Front-to-back compositing accumulators
     var accumulated_color = vec3<f32>(0.0);
     var accumulated_alpha = 0.0;
 
+    // Previous density for adaptive stepping
+    var prev_density = 0.0;
+
     // Raymarching loop
-    for (var i = 0; i < MAX_STEPS && i < step_count; i++) {
-        if t > t_far || accumulated_alpha > 0.95 {
-            break; // Early ray termination
+    for (var i = 0; i < MAX_STEPS; i++) {
+        // Stop conditions: past volume or nearly opaque
+        if t > t_far || accumulated_alpha > EARLY_TERMINATION_ALPHA {
+            break;
+        }
+
+        // Stop if we've exceeded configured step count
+        if i >= base_steps {
+            break;
         }
 
         // Current sample position in local space
-        let sample_pos = local_ray_origin + local_ray_dir * t;
+        let sample_pos = local_origin + local_dir * t;
 
-        // Convert to UV coordinates [0, 1]
-        let uv = world_to_uv(sample_pos);
+        // Convert to texture UV coordinates
+        let uv = local_to_uv(sample_pos);
 
-        // Check bounds (should be inside [0, 1])
-        if any(uv < vec3<f32>(0.0)) || any(uv > vec3<f32>(1.0)) {
+        // Bounds check (should be [0, 1] but check for numerical precision)
+        if any(uv < vec3<f32>(-0.001)) || any(uv > vec3<f32>(1.001)) {
             t += step_size;
             continue;
         }
 
+        // Clamp UV to valid range
+        let safe_uv = clamp(uv, vec3<f32>(0.0), vec3<f32>(1.0));
+
         // Sample volume density
-        let density = sample_volume(uv);
+        let density = sample_volume(safe_uv);
+
+        // Compute gradient for shading (only for visible regions)
+        var gradient = vec3<f32>(0.0);
+        if density > config.threshold * 0.5 {
+            gradient = compute_gradient(safe_uv);
+        }
 
         // Apply transfer function
-        let sample_color = transfer_function(density, config.threshold);
+        let sample_rgba = transfer_function(density, config.threshold, gradient, light_dir);
 
-        // Scale opacity by step size and density scale
-        let scaled_alpha = sample_color.a * step_size * config.density_scale;
+        // Skip fully transparent samples
+        if sample_rgba.a > 0.001 {
+            // Scale opacity by step size and density scale for correct accumulation
+            let scaled_alpha = sample_rgba.a * step_size * config.density_scale;
 
-        // Front-to-back compositing
-        let weight = (1.0 - accumulated_alpha) * scaled_alpha;
-        accumulated_color += sample_color.rgb * weight;
-        accumulated_alpha += weight;
+            // Front-to-back compositing formula
+            let weight = (1.0 - accumulated_alpha) * scaled_alpha;
+            accumulated_color += sample_rgba.rgb * weight;
+            accumulated_alpha += weight;
+        }
 
-        t += step_size;
+        // Adaptive stepping: take smaller steps near surfaces
+        var current_step = step_size;
+        let density_change = abs(density - prev_density);
+        if density_change > 0.1 && density > config.threshold * 0.3 {
+            // Near a surface transition - use half step for better quality
+            current_step = step_size * 0.5;
+        }
+        prev_density = density;
+
+        t += current_step;
     }
 
-    // Apply some ambient/background lighting
-    let ambient = vec3<f32>(0.1, 0.1, 0.12);
-    let final_color = accumulated_color + ambient * (1.0 - accumulated_alpha);
-
-    // If nothing was accumulated, discard the fragment
-    if accumulated_alpha < 0.01 {
+    // If nothing visible was accumulated, discard fragment
+    if accumulated_alpha < 0.005 {
         discard;
     }
 
-    return vec4<f32>(final_color, accumulated_alpha);
+    // Background color (subtle gradient for depth)
+    let bg_color = vec3<f32>(0.08, 0.08, 0.10);
+    let final_color = accumulated_color + bg_color * (1.0 - accumulated_alpha);
+
+    return vec4<f32>(final_color, min(accumulated_alpha, 1.0));
 }
