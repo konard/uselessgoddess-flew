@@ -2,14 +2,17 @@ use {
   bevy::{
     asset::RenderAssetUsages,
     image::ImageSampler,
+    mesh::MeshVertexBufferLayoutRef,
+    pbr::{MaterialPipeline, MaterialPipelineKey},
     prelude::*,
     render::render_resource::{
-      AsBindGroup, Extent3d, Face, ShaderType, TextureDimension, TextureFormat,
+      AsBindGroup, Extent3d, RenderPipelineDescriptor, ShaderType,
+      SpecializedMeshPipelineError, TextureDimension, TextureFormat,
     },
     shader::ShaderRef,
   },
   dicom::object::open_file,
-  std::{fs, path::Path},
+  std::fs,
 };
 
 use bevy_flycam::prelude::*;
@@ -18,8 +21,7 @@ const DICOM_FOLDER: &str = "assets/dicom";
 const MIN_HU: f32 = -1000.0;
 const MAX_HU: f32 = 3000.0;
 
-// --- НАСТРОЙКА РАЗРЕШЕНИЯ ---
-// 1 = 512x512, 2 = 256x256, 4 = 128x128
+// 1 = 512x512 (full resolution), 2 = 256x256, 4 = 128x128
 const DOWNSCALE_FACTOR: usize = 1;
 
 fn main() {
@@ -29,7 +31,7 @@ fn main() {
     .add_plugins(NoCameraPlayerPlugin)
     .insert_resource(MovementSettings {
       sensitivity: 0.00015,
-      speed: 12.0, // Можете уменьшить скорость, если модель 1.0 метр
+      speed: 12.0,
     })
     .insert_resource(KeyBindings {
       move_ascend: KeyCode::KeyE,
@@ -37,7 +39,6 @@ fn main() {
       ..Default::default()
     })
     .add_systems(Startup, setup)
-    // .add_systems(Update, rotate_cube) // Отключите вращение, чтобы летать самим
     .run();
 }
 
@@ -71,21 +72,21 @@ fn load_dicom_volume(folder_path: &str) -> VolumeInfo {
     }
   });
 
-  // --- ДАУНСКЕЙЛ (уменьшение количества файлов/слоев) ---
   let filtered_files: Vec<_> =
     files.into_iter().step_by(DOWNSCALE_FACTOR).collect();
   let new_depth = filtered_files.len() as u32;
 
-  let mut width = 0;
-  let mut height = 0;
-  let mut new_width = 0;
-  let mut new_height = 0;
+  let mut width: u32 = 0;
+  #[allow(unused_assignments)]
+  let mut height: u32 = 0;
+  let mut new_width: u32 = 0;
+  let mut new_height: u32 = 0;
 
   let mut final_voxels: Vec<f32> = vec![];
 
   for (i, path) in filtered_files.iter().enumerate() {
     if i % 10 == 0 {
-      println!("Loading downscaled slice {}/{}", i, new_depth);
+      println!("Loading slice {}/{}", i, new_depth);
     }
 
     let obj = open_file(path).unwrap();
@@ -102,10 +103,8 @@ fn load_dicom_volume(folder_path: &str) -> VolumeInfo {
         .and_then(|e| e.to_int().ok())
         .unwrap_or(512);
 
-      // Вычисляем новые размеры
       new_width = width / (DOWNSCALE_FACTOR as u32);
       new_height = height / (DOWNSCALE_FACTOR as u32);
-      // Резервируем память под финальный массив
       final_voxels.reserve_exact((new_width * new_height * new_depth) as usize);
     }
 
@@ -125,10 +124,8 @@ fn load_dicom_volume(folder_path: &str) -> VolumeInfo {
     let pixel_bytes =
       obj.element_by_name("PixelData").unwrap().to_bytes().unwrap();
 
-    // --- ДАУНСКЕЙЛ (пропуск пикселей по X и Y) ---
     for r in 0..new_height {
       for c in 0..new_width {
-        // Исходные координаты в файле 512x512
         let orig_y = r * (DOWNSCALE_FACTOR as u32);
         let orig_x = c * (DOWNSCALE_FACTOR as u32);
 
@@ -148,7 +145,7 @@ fn load_dicom_volume(folder_path: &str) -> VolumeInfo {
   }
 
   println!(
-    "Volume Loaded! New Scaled Size: {}x{}x{}",
+    "Volume loaded: {}x{}x{}",
     new_width, new_height, new_depth
   );
 
@@ -179,7 +176,7 @@ fn setup(
     TextureFormat::R32Float,
     RenderAssetUsages::all(),
   );
-  image.sampler = ImageSampler::nearest();
+  image.sampler = ImageSampler::linear();
   let image_handle = images.add(image);
 
   commands.spawn((
@@ -188,7 +185,10 @@ fn setup(
       volume_texture: image_handle,
       config: MaterialConfig { threshold: 0.25 },
     })),
-    Transform::from_xyz(0.0, 0.0, 0.0),
+    // Rotate -90 degrees around X to orient the head horizontally (upright)
+    // DICOM axial slices are stacked along Z; rotating brings the head to standard anatomical orientation
+    Transform::from_xyz(0.0, 0.0, 0.0)
+      .with_rotation(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2)),
   ));
 
   commands.spawn((
@@ -222,7 +222,19 @@ impl Material for VolumeMaterial {
   fn fragment_shader() -> ShaderRef {
     "shaders/volume.wgsl".into()
   }
+
   fn alpha_mode(&self) -> AlphaMode {
     AlphaMode::Blend
+  }
+
+  // Disable face culling so the volume is visible from both outside and inside the cube.
+  fn specialize(
+    _pipeline: &MaterialPipeline,
+    descriptor: &mut RenderPipelineDescriptor,
+    _layout: &MeshVertexBufferLayoutRef,
+    _key: MaterialPipelineKey<Self>,
+  ) -> Result<(), SpecializedMeshPipelineError> {
+    descriptor.primitive.cull_mode = None;
+    Ok(())
   }
 }
